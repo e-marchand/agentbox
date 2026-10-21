@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+"""agentbox: run AI coding agents (Claude Code, Copilot CLI...) in a macOS Seatbelt sandbox
+that only sees the folders and files listed in ~/.config/agentbox/config.yaml."""
+from __future__ import annotations
+
+import argparse
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+
+from agentbox_lib import config, host, sessions  # noqa: E402
+from agentbox_lib.agents import PROTECTED, get_agent, resolve_cmd  # noqa: E402
+from agentbox_lib.config import ConfigError, abbrev, expand  # noqa: E402
+from agentbox_lib.profile import build  # noqa: E402
+
+SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+DEFAULT_AGENT = "claude"
+
+
+def _kind(path: str) -> str:
+    p = expand(path)
+    if os.path.isdir(p):
+        return "dir"
+    if os.path.exists(p):
+        return "file"
+    return "missing"
+
+
+def _workdir(box: dict) -> str:
+    if box.get("workdir"):
+        return expand(box["workdir"])
+    for e in box["paths"]:
+        if e.get("mode", "rw") == "rw" and os.path.isdir(expand(e["path"])):
+            return expand(e["path"])
+    return tempfile.gettempdir()
+
+
+def _covered(path: str, box: dict) -> bool:
+    path = os.path.realpath(path)
+    for e in box["paths"]:
+        p = os.path.realpath(expand(e["path"]))
+        if e.get("mode", "rw") != "deny" and (path == p or path.startswith(p + os.sep)):
+            return True
+    return False
+
+
+def _writable(path: str, box: dict, agent: dict) -> bool:
+    path = os.path.realpath(path)
+    if path.startswith(("/private/tmp/", "/private/var/folders/")):
+        return True
+    for e in [*box["paths"], *agent.get("paths", [])]:
+        p = os.path.realpath(expand(e["path"]))
+        if e.get("mode", "rw") == "rw" and (path == p or path.startswith(p + os.sep)):
+            return True
+    return False
+
+
+def _host_commands(box: dict, agent: dict) -> dict:
+    """Validated host commands: each program must exist and must NOT be writable from inside."""
+    commands = host.normalize(box.get("host_commands", {}))
+    for name, spec in commands.items():
+        exe = spec["cmd"][0]
+        if not os.access(exe, os.X_OK):
+            raise ConfigError(f"host command {name!r}: {abbrev(exe)} is not an executable file")
+        if _writable(exe, box, agent):
+            raise ConfigError(f"host command {name!r}: {abbrev(exe)} is writable from the sandbox, "
+                              "the agent could change what runs outside it; make it ro")
+    return commands
+
+
+class Launch:
+    """Everything needed to start one sandboxed process."""
+
+    def __init__(self, cfg: dict, name: str, agent_name: str | None, cmd: list | None = None,
+                 need_cmd: bool = True):
+        box = config.get_box(cfg, name)
+        self.box_name = name
+        self.agent_name = agent_name or box.get("agent", DEFAULT_AGENT)
+        agent = get_agent(cfg, self.agent_name)
+        # Per-sandbox extra arguments, keyed by agent name (not used by `agentbox shell`).
+        self.cmd = cmd or resolve_cmd(agent["cmd"], need_cmd) + [
+            expand(x) if str(x).startswith("~/") else str(x)
+            for x in box.get("agent_args", {}).get(self.agent_name, [])]
+        self.sid = sessions.new_id()
+        self.hosts = _host_commands(box, agent)
+        # The agent binary itself must be readable when it lives under $HOME.
+        extra_ro = [self.cmd[0]] if self.cmd[0].startswith(config.HOME + os.sep) else []
+        if self.hosts:
+            extra_ro.append(str(ROOT))  # the agentbox-host client and its module (read-only)
+        protect = PROTECTED if box.get("protect", True) else []
+        self.profile = build(box, agent, extra_ro, protect)
+        self.cwd, self.env = _cwd_env(box, agent, name)
+        if self.hosts:
+            self.host_dir = host.session_dir(self.sid)
+            self.env["AGENTBOX_HOST"] = os.path.join(self.host_dir, host.SOCK_NAME)
+            self.env["PATH"] = f"{ROOT / 'bin'}:{self.env.get('PATH', '')}"
+
+    def argv(self, args=()) -> list:
+        return [SANDBOX_EXEC, "-p", self.profile, *self.cmd, *args]
+
+    def on_start(self, pid: int) -> None:
+        """Start the unsandboxed broker that serves host commands until the agent exits."""
+        if not self.hosts:
+            return
+        os.makedirs(self.host_dir, mode=0o700, exist_ok=True)
+        with open(os.path.join(self.host_dir, "broker.log"), "ab") as log:
+            subprocess.Popen([sys.executable, str(ROOT / "agentbox"), "_broker", self.box_name, self.host_dir,
+                              str(pid)], stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                             start_new_session=True)
+
+
+def _cwd_env(box: dict, agent: dict, name: str):
+    cwd = _workdir(box)
+    if not os.path.isdir(cwd):
+        raise ConfigError(f"workdir does not exist: {cwd}")
+    if not _covered(cwd, box) and not cwd.startswith(("/tmp", "/private/tmp", "/private/var/folders")):
+        print(f"agentbox: warning: workdir {abbrev(cwd)} is not in the sandbox paths", file=sys.stderr)
+
+    env = dict(os.environ)
+    env.update({k: str(v) for k, v in agent.get("env", {}).items()})
+    env.update({k: str(v) for k, v in box.get("env", {}).items()})
+    env["AGENTBOX"] = name
+    env["PWD"] = cwd
+    return cwd, env
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_init(cfg, a):
+    if a.box in cfg["sandboxes"]:
+        raise ConfigError(f"sandbox {a.box!r} already exists")
+    workdir = abbrev(a.workdir or os.getcwd())
+    box = {"agent": a.agent or DEFAULT_AGENT, "workdir": workdir, "paths": [{"path": workdir, "mode": "rw"}]}
+    cfg["sandboxes"][a.box] = box
+    config.save(cfg)
+    print(f"created sandbox {a.box!r} (workdir {workdir}, rw) in {abbrev(str(config.CONFIG_PATH))}")
+
+
+def cmd_drop(cfg, a):
+    config.get_box(cfg, a.box)
+    del cfg["sandboxes"][a.box]
+    config.save(cfg)
+    print(f"removed sandbox {a.box!r}")
+
+
+def cmd_add(cfg, a):
+    box = config.get_box(cfg, a.box)
+    for raw in a.paths:
+        path = abbrev(raw)
+        for e in box["paths"]:
+            if abbrev(e["path"]) == path:
+                e["mode"] = a.mode
+                break
+        else:
+            box["paths"].append({"path": path, "mode": a.mode})
+        note = " (does not exist yet)" if _kind(path) == "missing" else ""
+        print(f"{a.mode:4} {path}{note}")
+    config.save(cfg)
+
+
+def cmd_rm(cfg, a):
+    box = config.get_box(cfg, a.box)
+    targets = {abbrev(p) for p in a.paths}
+    before = len(box["paths"])
+    box["paths"] = [e for e in box["paths"] if abbrev(e["path"]) not in targets]
+    config.save(cfg)
+    print(f"removed {before - len(box['paths'])} path(s) from {a.box!r}")
+
+
+def cmd_ls(cfg, a):
+    names = [a.box] if a.box else list(cfg["sandboxes"])
+    if not names:
+        print("no sandbox yet: agentbox init <name>")
+    for name in names:
+        box = config.get_box(cfg, name)
+        flags = "" if box.get("protect", True) else "  [protect: off]"
+        print(f"{name}  agent={box.get('agent', DEFAULT_AGENT)}  workdir={abbrev(_workdir(box))}{flags}")
+        for e in box["paths"]:
+            print(f"   {e.get('mode', 'rw'):4} {_kind(e['path']):7} {e['path']}")
+        for k, v in box.get("env", {}).items():
+            print(f"   env  {k}={v}")
+        for k, spec in box.get("host_commands", {}).items():
+            print(f"   host {k}: {' '.join(spec['cmd'])}{' [args...]' if spec.get('args') else ''}")
+
+
+def cmd_edit(cfg, a):
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    config.CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if not config.CONFIG_PATH.exists():
+        config.save(cfg)
+    fd, tmp = tempfile.mkstemp(suffix=".yaml", dir=config.CONFIG_PATH.parent)
+    os.close(fd)
+    shutil.copyfile(config.CONFIG_PATH, tmp)
+    try:
+        while True:
+            subprocess.call([*shlex.split(editor), tmp])
+            try:
+                with open(tmp) as f:
+                    config.validate(config.yaml.safe_load(f) or {})
+                break
+            except (ConfigError, config.yaml.YAMLError) as e:
+                print(f"agentbox: invalid config: {e}", file=sys.stderr)
+                if input("re-edit? [Y/n] ").strip().lower() == "n":
+                    print("changes discarded")
+                    return
+        os.replace(tmp, config.CONFIG_PATH)
+        print(f"saved {abbrev(str(config.CONFIG_PATH))}")
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def cmd_profile(cfg, a):
+    print(Launch(cfg, a.box, a.agent, need_cmd=False).profile, end="")
+
+
+def _host_banner(lc: Launch) -> None:
+    if lc.hosts:
+        print(f"agentbox: host commands: {', '.join(lc.hosts)} (agentbox-host list)", file=sys.stderr)
+
+
+def cmd_run(cfg, a):
+    lc = Launch(cfg, a.box, a.agent)
+    argv, display = lc.argv(a.args), lc.cmd + a.args
+    if a.detach:
+        info = sessions.run_detached(lc.sid, a.box, lc.agent_name, argv, lc.cwd, lc.env, display, lc.on_start)
+        print(f"session {info['id']} started (pid {info['pid']}), log: {abbrev(info['log'])}")
+        return 0
+    print(f"agentbox: {lc.agent_name} in sandbox {a.box!r} ({abbrev(lc.cwd)})", file=sys.stderr)
+    _host_banner(lc)
+    return sessions.run_foreground(lc.sid, a.box, lc.agent_name, argv, lc.cwd, lc.env, display, lc.on_start)
+
+
+def cmd_shell(cfg, a):
+    shell = ["/bin/zsh", "-f", "-i"]
+    lc = Launch(cfg, a.box, a.agent, cmd=shell)
+    lc.env["PS1"] = f"%F{{yellow}}[agentbox:{a.box}]%f %~ %# "
+    print(f"agentbox: sandboxed shell for {a.box!r} (agent paths: {lc.agent_name}), exit to leave", file=sys.stderr)
+    _host_banner(lc)
+    return sessions.run_foreground(lc.sid, a.box, "shell", lc.argv(), lc.cwd, lc.env, shell, lc.on_start)
+
+
+def cmd_broker(cfg, a):
+    box = config.get_box(cfg, a.box)
+    host.Broker(box.get("host_commands", {}), a.dir, int(a.pid)).serve()
+
+
+def cmd_ps(cfg, a):
+    live = sessions.list_sessions()
+    if not live:
+        print("no running session")
+    for s in live:
+        print(f"{s['id']}  {s['box']:<16} {s['agent']:<8} pid={s['pid']:<7} {s['started']}  {abbrev(s['cwd'])}")
+
+
+def cmd_stop(cfg, a):
+    live = sessions.list_sessions()
+    if a.all:
+        targets = live
+    elif a.target:
+        targets = [s for s in live if a.target in (s["id"], s["box"], str(s["pid"]))]
+    else:
+        raise ConfigError("give a sandbox name, a session id, a pid or --all")
+    if not targets:
+        print("nothing to stop")
+    for s in targets:
+        sessions.stop(s)
+        print(f"stopped {s['id']} ({s['box']}, {s['agent']}, pid {s['pid']})")
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    # Everything after the first `--` goes verbatim to the agent.
+    agent_args = argv[argv.index("--") + 1:] if "--" in argv else []
+    argv = argv[:argv.index("--")] if "--" in argv else argv
+
+    p = argparse.ArgumentParser(prog="agentbox", description=__doc__,
+                                epilog="example: agentbox run mybox -- -p 'fix the tests'")
+    sub = p.add_subparsers(dest="command", required=True, metavar="command")
+
+    s = sub.add_parser("init", help="create a sandbox (workdir = current dir, rw)")
+    s.add_argument("box")
+    s.add_argument("--workdir")
+    s.add_argument("--agent")
+    s.set_defaults(func=cmd_init)
+
+    s = sub.add_parser("drop", help="delete a sandbox definition (files are untouched)")
+    s.add_argument("box")
+    s.set_defaults(func=cmd_drop)
+
+    s = sub.add_parser("add", help="allow folders/files in a sandbox")
+    s.add_argument("box")
+    s.add_argument("paths", nargs="+")
+    m = s.add_mutually_exclusive_group()
+    m.add_argument("--rw", dest="mode", action="store_const", const="rw", help="read-write (default)")
+    m.add_argument("--ro", dest="mode", action="store_const", const="ro", help="read-only")
+    m.add_argument("--deny", dest="mode", action="store_const", const="deny",
+                   help="hide a path inside an allowed folder")
+    s.set_defaults(func=cmd_add, mode="rw")
+
+    s = sub.add_parser("rm", help="remove paths from a sandbox")
+    s.add_argument("box")
+    s.add_argument("paths", nargs="+")
+    s.set_defaults(func=cmd_rm)
+
+    s = sub.add_parser("ls", help="list sandboxes and their paths")
+    s.add_argument("box", nargs="?")
+    s.set_defaults(func=cmd_ls)
+
+    s = sub.add_parser("edit", help="edit the YAML config in $EDITOR")
+    s.set_defaults(func=cmd_edit)
+
+    for name, func, hlp in (("run", cmd_run, "start the agent in the sandbox"),
+                            ("shell", cmd_shell, "open a sandboxed zsh to test the rules"),
+                            ("profile", cmd_profile, "print the generated Seatbelt profile")):
+        s = sub.add_parser(name, help=hlp)
+        s.add_argument("box")
+        s.add_argument("--agent", help="override the sandbox's agent (claude, copilot...)")
+        if name == "run":
+            s.add_argument("-d", "--detach", action="store_true", help="run in background, output to a log")
+        s.set_defaults(func=func)
+
+    s = sub.add_parser("ps", help="list running sessions")
+    s.set_defaults(func=cmd_ps)
+
+    s = sub.add_parser("stop", help="stop sessions (by sandbox name, session id or pid)")
+    s.add_argument("target", nargs="?")
+    s.add_argument("--all", action="store_true")
+    s.set_defaults(func=cmd_stop)
+
+    s = sub.add_parser("_broker")  # internal: serves host commands for one session
+    s.add_argument("box")
+    s.add_argument("dir")
+    s.add_argument("pid")
+    s.set_defaults(func=cmd_broker)
+
+    a = p.parse_args(argv)
+    a.args = agent_args
+    try:
+        cfg = config.load()
+        return a.func(cfg, a) or 0
+    except ConfigError as e:
+        print(f"agentbox: {e}", file=sys.stderr)
+        return 2
+    except config.yaml.YAMLError as e:
+        print(f"agentbox: cannot parse {config.CONFIG_PATH}: {e}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

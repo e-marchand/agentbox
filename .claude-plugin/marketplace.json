@@ -1,0 +1,14 @@
+{
+  "name": "agentbox",
+  "description": "agentbox: sandbox AI coding agents on macOS with Seatbelt.",
+  "owner": {
+    "name": "Eric Marchand"
+  },
+  "plugins": [
+    {
+      "name": "agentbox",
+      "source": "./",
+      "description": "Skill for agentbox: run AI coding agents in a macOS Seatbelt sandbox limited to an allowlist of folders and files."
+    }
+  ]
+}

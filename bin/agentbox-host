@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""agentbox-host: ask agentbox to run a whitelisted command OUTSIDE the sandbox.
+
+  agentbox-host list                    commands you may run
+  agentbox-host run <name> [args...]    run and stream the output (exit code = the command's)
+  agentbox-host start <name> [args...]  run in background, print the log path
+  agentbox-host wait <name>             stream the output of a started command until it ends
+  agentbox-host status                  running / finished commands
+  agentbox-host kill <name>             stop a running command
+
+Long commands keep running if this client is interrupted: use `wait` to re-attach.
+"""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from agentbox_lib.host import request  # noqa: E402
+
+
+def main(argv) -> int:
+    sock = os.environ.get("AGENTBOX_HOST")
+    if not sock:
+        print("agentbox-host: not inside an agentbox session with host commands", file=sys.stderr)
+        return 2
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    op, rest = argv[0], argv[1:]
+    if op not in ("list", "run", "start", "wait", "status", "kill"):
+        print(f"agentbox-host: unknown command {op!r}\n\n{__doc__.strip()}", file=sys.stderr)
+        return 2
+    if op in ("run", "start", "wait", "kill") and not rest:
+        print(f"agentbox-host: {op} needs a command name", file=sys.stderr)
+        return 2
+    req = {"op": op, "name": rest[0] if rest else "", "args": rest[1:]}
+
+    code = 0
+    try:
+        for msg in request(sock, req):
+            if "error" in msg:
+                print(f"agentbox-host: {msg['error']}", file=sys.stderr)
+                code = 2
+            elif "out" in msg:
+                sys.stdout.write(msg["out"])
+                sys.stdout.flush()
+            elif "exit" in msg:
+                code = msg["exit"]
+                print(f"\n[agentbox-host] {req['name']} exited with code {code}", file=sys.stderr)
+            elif "started" in msg:
+                print(f"[agentbox-host] {msg['started']} started, log: {msg['log']}", file=sys.stderr)
+            elif "commands" in msg:
+                for name, spec in msg["commands"].items():
+                    args = " [args...]" if spec["args"] else ""
+                    print(f"{name}{args}\t{spec['description']}")
+            elif "jobs" in msg:
+                if not msg["jobs"]:
+                    print("nothing started yet")
+                for j in msg["jobs"]:
+                    state = "running" if j["running"] else f"exit {j['exit']}"
+                    print(f"{j['name']}\t{state}\tstarted {j['started']}\t{' '.join(j['args'])}\tlog: {j['log']}")
+            elif "killed" in msg:
+                print(f"killed {msg['killed']}")
+    except KeyboardInterrupt:
+        print(f"\n[agentbox-host] detached, {req['name']} keeps running: agentbox-host wait {req['name']}",
+              file=sys.stderr)
+        return 130
+    except (FileNotFoundError, ConnectionRefusedError):
+        print("agentbox-host: broker not reachable (session ended?)", file=sys.stderr)
+        return 2
+    if code < 0:
+        code = 128 - code
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

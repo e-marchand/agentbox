@@ -1,0 +1,32 @@
+# ~/.config/agentbox/config.yaml
+sandboxes:
+  myproj:
+    agent: claude                  # claude | copilot | an agent defined below
+    workdir: ~/git/myproj          # the agent's current directory
+    paths:
+      - {path: ~/git/myproj, mode: rw}             # read-write folder
+      - {path: ~/git/myproj/.git/hooks, mode: ro}  # nested rules: the later entry wins
+      - {path: ~/git/myproj/.git/config, mode: ro}
+      - {path: ~/git/shared-lib, mode: ro}         # read-only folder
+      - {path: ~/notes/todo.md, mode: rw}          # a single file, its siblings stay hidden
+      - {path: ~/git/myproj/.env, mode: deny}      # hidden even inside an allowed folder
+      - {path: ~/.npm, mode: rw}                   # tool caches when needed
+    env:
+      FOO: bar
+    agent_args:                    # extra arguments, per agent
+      claude: [--add-dir, ~/git/shared-lib]
+    host_commands:                 # commands the agent may run OUTSIDE the sandbox (agentbox-host)
+      build:
+        cmd: [~/bin/build-myproj.sh]   # must not be writable from the sandbox
+        args: true                     # the agent may pass arguments (validate them in the script)
+        description: "build myproj, args: [debug|release]"
+    # protect: false               # allow writing ~/.claude/settings.json, hooks, etc.
+
+agents:
+  # Override a built-in agent (given keys replace the defaults)
+  claude:
+    cmd: [claude, --settings, '{"sandbox":{"enabled":false}}', --dangerously-skip-permissions]
+  # Custom agent: its command and the state paths it needs
+  sh:
+    cmd: [/bin/zsh, -f]
+    paths: []
